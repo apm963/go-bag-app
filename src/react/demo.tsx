@@ -7,28 +7,38 @@ import { configure } from 'mobx';
 configure({ enforceActions: "observed" });
 
 const store = new RootStore();
-let hmrStoreLoadResult: null|boolean = null;
 
-if ('_hmr' in (window as any) && 'storeJson' in (window as any)._hmr && (window as any)._hmr.storeJson) {
+async function main() {
+	
+	// NOTE: This is done here instead of in module.hot.accept because that runs after that components have mounted
+	if ('_hmr' in (window as any)) {
+		if ('storeJsonPromise' in (window as any)._hmr && (window as any)._hmr.storeJsonPromise) {
+			await (window as any)._hmr.storeJsonPromise;
+		}
+		if ('storeJson' in (window as any)._hmr && (window as any)._hmr.storeJson) {
+			store.fromJson((window as any)._hmr.storeJson);
+		}
+	}
+	
+	// @ts-ignore
+	window.debugStore = store; // DEBUG
+	
+	// Init store
+	// TODO: Init store if needed
+	
 	try {
-		store.fromJson((window as any)._hmr.storeJson);
-		hmrStoreLoadResult = true;
+		ReactDOM.render(
+			<App rootStore={store} />,
+			document.getElementById('root') as HTMLElement
+		);
 	}
 	catch (err) {
 		console.error(err);
-		hmrStoreLoadResult = false;
 	}
+	
 }
 
-try {
-	ReactDOM.render(
-		<App rootStore={store} />,
-		document.getElementById('root') as HTMLElement
-	);
-}
-catch (err) {
-	console.error(err);
-}
+main();
 
 const tempModule = module as any | { hot?: unknown };
 
@@ -40,6 +50,11 @@ if (tempModule && 'hot' in tempModule && (tempModule as {hot?: unknown}).hot) {
 		origBodyMarginPadding?: number;
 		indicatorInterval?: NodeJS.Timeout;
 		storeJson?: string;
+		storeJsonPromise?: Promise<true>;
+		stats?: {
+			hmrStart: number;
+			storeRehydrateStart: number;
+		};
 	}
 	
 	const windowTyped: Window & { _hmr: WindowHmrIface } = window as any;
@@ -50,10 +65,15 @@ if (tempModule && 'hot' in tempModule && (tempModule as {hot?: unknown}).hot) {
 	}
 	
 	const windowHmr = windowTyped._hmr;
+	const defaultStats = {
+		hmrStart: 0,
+		storeRehydrateStart: 0,
+	};
 	
 	windowHmr.loaded = windowHmr.loaded || true;
+	windowHmr.stats = windowHmr.stats ?? defaultStats;
 	
-	const hmrIndicator = (type: 'ok'|'error' = 'ok') => {
+	const hmrIndicator = (status: 'loading'|'error'|'complete') => {
 		
 		const bodyElCollection = document.getElementsByTagName('body');
 		if (!bodyElCollection) { return; }
@@ -71,25 +91,37 @@ if (tempModule && 'hot' in tempModule && (tempModule as {hot?: unknown}).hot) {
 		const origStyle: CSSStyleDeclaration = windowHmr.origBodyStyle;
 		const bodyMarginPadding = windowHmr.origBodyMarginPadding;
 		
-		const borderColor = (type === 'error' ? 'rgba(255, 0, 0, 1)' : 'rgba(0, 188, 212, 1)');
+		const rgba: [number, number, number, number] = (
+			status === 'complete'
+			? [0, 188, 212, 1]
+			: (
+				status === 'loading'
+				? [177, 177, 82, 1]
+				: [177, 82, 82, 1] // error
+			)
+		);
 		
-		bodyEl.style.margin = '0 auto';
+		bodyEl.style.margin = '0';
 		bodyEl.style.padding = `${bodyMarginPadding / 2}px`;
-		bodyEl.style.border = `${bodyMarginPadding / 2}px solid ${borderColor}`;
-		
-		let alpha = 1.0;
+		bodyEl.style.border = `${bodyMarginPadding / 2}px solid rgba(${rgba.join(', ')})`;
 		
 		// If an interval is already mid-stream transitioning, cancel it and restart
 		if (windowHmr.indicatorInterval) {
 			clearInterval(windowHmr.indicatorInterval);
 		}
 		
+		if (status !== 'complete') {
+			// We only want 'complete' to fade away
+			return;
+		}
+		
+		// TODO: Probably make this a CSS transition for GPU acceleration (among other things)
 		windowHmr.indicatorInterval = setInterval(() => {
 			
-			alpha -= 0.006; // This number is from tweaking
-			bodyEl.style.borderColor = (type === 'error' ? `rgba(255, 0, 0, ${alpha})` : `rgba(0, 188, 212, ${alpha})`);
+			rgba[3] -= 0.006; // This number [alpha] is from tweaking
+			bodyEl.style.borderColor = `rgba(${rgba.join(', ')})`;
 			
-			if (alpha <= 0.0) {
+			if (rgba[3] <= 0.0) {
 				if (windowHmr.indicatorInterval) {
 					clearInterval(windowHmr.indicatorInterval);
 				}
@@ -103,19 +135,37 @@ if (tempModule && 'hot' in tempModule && (tempModule as {hot?: unknown}).hot) {
 		
 	};
 	
-	(module as any).hot.dispose(function () {
+	(module as any).hot.dispose(() => {
 		// module is about to be replaced
-		try {
-			windowHmr.storeJson = store.toJson();
-		}
-		catch (err) {
-			console.error(err);
-		}
+		
+		windowHmr.stats && (windowHmr.stats.hmrStart = Date.now());
+		
+		hmrIndicator('loading');
+		
+		const oldStore = store;
+		
+		windowHmr.storeJsonPromise = new Promise(resolve => setTimeout(() => {
+			windowHmr.stats && (windowHmr.stats.storeRehydrateStart = Date.now());
+			windowHmr.storeJson = oldStore.toJson();
+			hmrIndicator('complete');
+			windowHmr.storeJsonPromise && windowHmr.storeJsonPromise.then(() => delete windowHmr.storeJsonPromise);
+			return resolve(true);
+		}, 0));
+		
 	});
 	
-	(module as any).hot.accept(function () {
+	(module as any).hot.accept(async () => {
 		// module or one of its dependencies was just updated
-		hmrIndicator(hmrStoreLoadResult === false ? 'error' : 'ok');
+		const hmrEnd = Date.now() - (windowHmr.stats?.hmrStart ?? 0);
+		if (!windowHmr.storeJsonPromise) {
+			hmrIndicator('complete');
+		}
+		else {
+			await windowHmr.storeJsonPromise;
+		}
+		const storeRehydrateEnd = Date.now() - (windowHmr.stats?.storeRehydrateStart ?? 0);
+		console.debug(`HMR stats: module ${hmrEnd}ms + store ${storeRehydrateEnd}ms = total ${hmrEnd + storeRehydrateEnd}ms @${moment().format('HH:mm:ss')}`);
+		windowHmr.stats = defaultStats;
 	});
 	
 }
